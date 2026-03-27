@@ -1,0 +1,79 @@
+version: 2
+
+project_name: taghound
+
+before:
+  hooks:
+    - go mod tidy
+    - go test -race ./...
+
+builds:
+  - env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w -X main.Version={{.Version}}
+
+archives:
+  - format: tar.gz
+    name_template: >-
+      {{ .ProjectName }}_{{ .Os }}_{{ .Arch }}
+    format_overrides:
+      - goos: windows
+        format: zip
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^style:"
+      - "^chore\\(deps\\):"
+
+brews:
+  - repository:
+      owner: jee4nc
+      name: homebrew-tap
+      token: "{{ .Env.TAP_GITHUB_TOKEN }}"
+    homepage: https://github.com/jee4nc/taghound
+    description: A fast CLI tool that tracks Git releases by reading branches and tags
+    license: MIT
+    dependencies:
+      - name: git
+    install: |
+      bin.install "taghound"
+    test: |
+      system "#{bin}/taghound", "--version"
+
+scoops:
+  - repository:
+      owner: jee4nc
+      name: scoop-bucket
+      token: "{{ .Env.TAP_GITHUB_TOKEN }}"
+    homepage: https://github.com/jee4nc/taghound
+    description: A fast CLI tool that tracks Git releases by reading branches and tags
+    license: MIT
+
+nfpms:
+  - package_name: taghound
+    homepage: https://github.com/jee4nc/taghound
+    maintainer: jee4nc
+    description: A fast CLI tool that tracks Git releases by reading branches and tags
+    license: MIT
+    formats:
+      - deb
+      - rpm
+    dependencies:
+      - git
+    contents:
+      - src: ./LICENSE
+        dst: /usr/share/doc/taghound/LICENSE

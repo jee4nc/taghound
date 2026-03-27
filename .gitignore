@@ -2,3 +2,4 @@ dist/
 taghound
 .claude/
 .cursorrules
+.goreleaser-artifacts/

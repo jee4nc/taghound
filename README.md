@@ -20,6 +20,40 @@ A fast CLI tool that tracks Git releases by reading **branches** and **tags** wi
 
 ## Installation
 
+### Homebrew (macOS / Linux)
+
+```bash
+brew install jee4nc/tap/taghound
+```
+
+### Scoop (Windows)
+
+```powershell
+scoop bucket add taghound https://github.com/jee4nc/scoop-bucket
+scoop install taghound
+```
+
+### Debian / Ubuntu (.deb)
+
+Download the `.deb` package from the [Releases](../../releases) page:
+
+```bash
+sudo dpkg -i taghound_*.deb
+```
+
+### Pre-built binaries
+
+Download from the [Releases](../../releases) page for your platform:
+
+| Platform         | Archive                          |
+|------------------|----------------------------------|
+| macOS arm64      | `taghound_darwin_arm64.tar.gz`   |
+| macOS amd64      | `taghound_darwin_amd64.tar.gz`   |
+| Linux arm64      | `taghound_linux_arm64.tar.gz`    |
+| Linux amd64      | `taghound_linux_amd64.tar.gz`    |
+| Windows amd64    | `taghound_windows_amd64.zip`     |
+| Windows arm64    | `taghound_windows_arm64.zip`     |
+
 ### From source
 
 ```bash
@@ -29,17 +63,6 @@ make install
 # Or just build
 go build -o taghound .
 ```
-
-### Pre-built binaries
-
-Download from the [Releases](../../releases) page for your platform:
-
-| Platform         | Binary                        |
-|------------------|-------------------------------|
-| macOS arm64      | `taghound-darwin-arm64`       |
-| macOS amd64      | `taghound-darwin-amd64`       |
-| Linux amd64      | `taghound-linux-amd64`        |
-| Windows amd64    | `taghound-windows-amd64.exe`  |
 
 ## Requirements
 
