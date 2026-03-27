@@ -2,20 +2,21 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, release-*]
   pull_request:
-    branches: [main]
+    branches: [main, release-*]
 
 jobs:
   test:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+          cache: false
 
       - name: Run tests
         run: go test -v ./...
