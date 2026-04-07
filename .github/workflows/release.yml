@@ -1,36 +1,44 @@
 name: Release
 
 on:
+  # Manual tags (minor/major): git tag v1.3.0 && git push --tags
   push:
     tags:
       - "v*"
+
+  # Auto-patch tags from merged PRs
+  workflow_run:
+    workflows: ["Auto Patch Tag"]
+    types: [completed]
 
 permissions:
   contents: write
 
 jobs:
-  test:
+  release:
+    if: >
+      (github.event_name == 'push') ||
+      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success')
     runs-on: ubuntu-latest
+
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get latest tag
+        if: github.event_name == 'workflow_run'
+        run: |
+          git fetch --tags
+          TAG=$(git tag -l 'v*' --sort=-v:refname | head -1)
+          echo "GORELEASER_CURRENT_TAG=$TAG" >> "$GITHUB_ENV"
+          echo "📦 Releasing tag: $TAG"
 
       - uses: actions/setup-go@v5
         with:
           go-version: stable
 
       - run: go test -race -v ./...
-
-  release:
-    needs: test
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - uses: actions/setup-go@v5
-        with:
-          go-version: stable
 
       - uses: goreleaser/goreleaser-action@v6
         with:
