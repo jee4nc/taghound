@@ -38,6 +38,8 @@ Include a body only when the title alone is insufficient. Use bullet points, max
 
 ## Release Process
 
+- `main` is the release branch; features go in topic branches merged via PR
+- Each merged PR to `main` auto-creates a patch tag (e.g., `v1.2.3` → `v1.2.4`)
+- Minor/major version bumps are done manually (`git tag v1.3.0 && git push --tags`)
 - Tags matching `v*` trigger the release workflow (GoReleaser v2)
-- Auto-tagging workflow creates `vX.Y.0` on new `release-X.Y` branches and increments patch on pushes/merges
 - Distributed via GitHub releases, Homebrew (`jee4nc/tap/taghound`), Scoop, and .deb/.rpm packages
