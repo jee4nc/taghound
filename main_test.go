@@ -15,9 +15,9 @@ func TestSemverString(t *testing.T) {
 		sv   semver
 		want string
 	}{
-		{"major.minor only", semver{1, 2, 0}, "1.2"},
+		{"major.minor only", semver{1, 2, 0}, "1.2.0"},
 		{"with patch", semver{1, 2, 3}, "1.2.3"},
-		{"zeros", semver{0, 0, 0}, "0.0"},
+		{"zeros", semver{0, 0, 0}, "0.0.0"},
 		{"large numbers", semver{100, 200, 300}, "100.200.300"},
 	}
 	for _, tt := range tests {

@@ -38,9 +38,6 @@ type semver struct {
 }
 
 func (s semver) String() string {
-	if s.Patch == 0 {
-		return fmt.Sprintf("%d.%d", s.Major, s.Minor)
-	}
 	return fmt.Sprintf("%d.%d.%d", s.Major, s.Minor, s.Patch)
 }
 
@@ -104,11 +101,15 @@ func main() {
 	}
 
 	if len(positional) > 0 && positional[0] == "config" {
-		handleConfig(positional[1:])
+		if err := handleConfig(positional[1:]); err != nil {
+			fatal(err.Error())
+		}
 		return
 	}
 
-	runTracker(profileOverride, dirtyMode)
+	if err := runTracker(profileOverride, dirtyMode); err != nil {
+		fatal(err.Error())
+	}
 }
 
 func printUsage() {
@@ -144,9 +145,12 @@ func printUsage() {
 
 // --- Config I/O ---
 
-func configPath() string {
-	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".config", "taghound", "config.json")
+func configPath() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("could not determine home directory: %w", err)
+	}
+	return filepath.Join(home, ".config", "taghound", "config.json"), nil
 }
 
 func defaultConfig() Config {
@@ -158,15 +162,19 @@ func defaultConfig() Config {
 	}
 }
 
-func loadConfig() Config {
-	data, err := os.ReadFile(configPath())
+func loadConfig() (Config, error) {
+	path, err := configPath()
 	if err != nil {
-		return defaultConfig()
+		return defaultConfig(), nil // fallback to defaults if home dir unavailable
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return defaultConfig(), nil
 	}
 	var cfg Config
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		warn("Corrupt config, using defaults: " + err.Error())
-		return defaultConfig()
+		return defaultConfig(), nil
 	}
 	if cfg.Profiles == nil {
 		cfg.Profiles = make(map[string]Profile)
@@ -178,49 +186,56 @@ func loadConfig() Config {
 	if cfg.Active == "" {
 		cfg.Active = "default"
 	}
-	return cfg
+	return cfg, nil
 }
 
-func saveConfig(cfg Config) {
-	path := configPath()
+func saveConfig(cfg Config) error {
+	path, err := configPath()
+	if err != nil {
+		return err
+	}
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
-		fatal("Could not create config directory: " + err.Error())
+		return fmt.Errorf("could not create config directory: %w", err)
 	}
 	data, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
-		fatal("Could not serialize config: " + err.Error())
+		return fmt.Errorf("could not serialize config: %w", err)
 	}
 	if err := os.WriteFile(path, data, 0644); err != nil {
-		fatal("Could not save config: " + err.Error())
+		return fmt.Errorf("could not save config: %w", err)
 	}
+	return nil
 }
 
 // --- Config Commands ---
 
-func handleConfig(args []string) {
+func handleConfig(args []string) error {
 	if len(args) == 0 {
 		fmt.Printf("  %s%s⚠️  Use 'taghound config <command>'. Run 'taghound -h' for options.%s\n", Bold, Yellow, Reset)
-		return
+		return nil
 	}
 
 	switch args[0] {
 	case "list":
-		cmdConfigList()
+		return cmdConfigList()
 	case "show":
-		cmdConfigShow()
+		return cmdConfigShow()
 	case "set":
-		cmdConfigSet(args[1:])
+		return cmdConfigSet(args[1:])
 	case "use":
-		cmdConfigUse(args[1:])
+		return cmdConfigUse(args[1:])
 	case "delete":
-		cmdConfigDelete(args[1:])
+		return cmdConfigDelete(args[1:])
 	default:
-		fatal(fmt.Sprintf("Unknown config command: '%s'. Run 'taghound -h' for options.", args[0]))
+		return fmt.Errorf("unknown config command: '%s'. Run 'taghound -h' for options", args[0])
 	}
 }
 
-func cmdConfigList() {
-	cfg := loadConfig()
+func cmdConfigList() error {
+	cfg, err := loadConfig()
+	if err != nil {
+		return err
+	}
 	fmt.Println()
 	fmt.Printf("  %s%sTagHound Profiles%s\n", Bold, Cyan, Reset)
 	fmt.Printf("  %s%s%s\n", Gray, strings.Repeat("─", 40), Reset)
@@ -246,13 +261,17 @@ func cmdConfigList() {
 			Gray, Reset, Cyan, p.TagPrefix, Reset)
 	}
 	fmt.Println()
+	return nil
 }
 
-func cmdConfigShow() {
-	cfg := loadConfig()
+func cmdConfigShow() error {
+	cfg, err := loadConfig()
+	if err != nil {
+		return err
+	}
 	p, ok := cfg.Profiles[cfg.Active]
 	if !ok {
-		fatal(fmt.Sprintf("Active profile '%s' not found in config", cfg.Active))
+		return fmt.Errorf("active profile '%s' not found in config", cfg.Active)
 	}
 	fmt.Println()
 	fmt.Printf("  %s%sActive profile: %s%s\n", Bold, Cyan, cfg.Active, Reset)
@@ -262,11 +281,12 @@ func cmdConfigShow() {
 	fmt.Printf("  %sBranch regex:%s   %s%s%s\n", Gray, Reset, Gray, buildBranchPattern(p.BranchPrefix), Reset)
 	fmt.Printf("  %sTag regex:%s      %s%s%s\n", Gray, Reset, Gray, buildTagPattern(p.TagPrefix), Reset)
 	fmt.Println()
+	return nil
 }
 
-func cmdConfigSet(args []string) {
+func cmdConfigSet(args []string) error {
 	if len(args) == 0 {
-		fatal("Usage: taghound config set <name> --branch <prefix> --tag <prefix>")
+		return fmt.Errorf("usage: taghound config set <name> --branch <prefix> --tag <prefix>")
 	}
 
 	name := args[0]
@@ -277,22 +297,25 @@ func cmdConfigSet(args []string) {
 		switch remaining[i] {
 		case "--branch":
 			if i+1 >= len(remaining) {
-				fatal("--branch requires a value")
+				return fmt.Errorf("--branch requires a value")
 			}
 			i++
 			branchPrefix = remaining[i]
 		case "--tag":
 			if i+1 >= len(remaining) {
-				fatal("--tag requires a value")
+				return fmt.Errorf("--tag requires a value")
 			}
 			i++
 			tagPrefix = remaining[i]
 		default:
-			fatal(fmt.Sprintf("Unknown option: '%s'", remaining[i]))
+			return fmt.Errorf("unknown option: '%s'", remaining[i])
 		}
 	}
 
-	cfg := loadConfig()
+	cfg, err := loadConfig()
+	if err != nil {
+		return err
+	}
 
 	existing, exists := cfg.Profiles[name]
 	if exists {
@@ -306,12 +329,14 @@ func cmdConfigSet(args []string) {
 		cfg.Profiles[name] = existing
 	} else {
 		if branchPrefix == "" || tagPrefix == "" {
-			fatal("Both --branch <prefix> and --tag <prefix> are required to create a new profile")
+			return fmt.Errorf("both --branch <prefix> and --tag <prefix> are required to create a new profile")
 		}
 		cfg.Profiles[name] = Profile{BranchPrefix: branchPrefix, TagPrefix: tagPrefix}
 	}
 
-	saveConfig(cfg)
+	if err := saveConfig(cfg); err != nil {
+		return err
+	}
 	p := cfg.Profiles[name]
 	if exists {
 		fmt.Printf("  %s%s✅ Profile '%s' updated%s\n", Bold, Green, name, Reset)
@@ -321,45 +346,58 @@ func cmdConfigSet(args []string) {
 	fmt.Printf("     %sbranch:%s %s%s%s  %stag:%s %s%s%s\n",
 		Gray, Reset, Cyan, p.BranchPrefix, Reset,
 		Gray, Reset, Cyan, p.TagPrefix, Reset)
+	return nil
 }
 
-func cmdConfigUse(args []string) {
+func cmdConfigUse(args []string) error {
 	if len(args) == 0 {
-		fatal("Usage: taghound config use <name>")
+		return fmt.Errorf("usage: taghound config use <name>")
 	}
 	name := args[0]
-	cfg := loadConfig()
+	cfg, err := loadConfig()
+	if err != nil {
+		return err
+	}
 
 	if _, ok := cfg.Profiles[name]; !ok {
-		fatal(fmt.Sprintf("Profile '%s' does not exist. Run 'taghound config list' to see available profiles.", name))
+		return fmt.Errorf("profile '%s' does not exist. Run 'taghound config list' to see available profiles", name)
 	}
 
 	cfg.Active = name
-	saveConfig(cfg)
+	if err := saveConfig(cfg); err != nil {
+		return err
+	}
 	fmt.Printf("  %s%s✅ Active profile: %s%s\n", Bold, Green, name, Reset)
+	return nil
 }
 
-func cmdConfigDelete(args []string) {
+func cmdConfigDelete(args []string) error {
 	if len(args) == 0 {
-		fatal("Usage: taghound config delete <name>")
+		return fmt.Errorf("usage: taghound config delete <name>")
 	}
 	name := args[0]
 
 	if name == "default" {
-		fatal("Cannot delete the 'default' profile")
+		return fmt.Errorf("cannot delete the 'default' profile")
 	}
 
-	cfg := loadConfig()
+	cfg, err := loadConfig()
+	if err != nil {
+		return err
+	}
 	if _, ok := cfg.Profiles[name]; !ok {
-		fatal(fmt.Sprintf("Profile '%s' does not exist.", name))
+		return fmt.Errorf("profile '%s' does not exist", name)
 	}
 
 	delete(cfg.Profiles, name)
 	if cfg.Active == name {
 		cfg.Active = "default"
 	}
-	saveConfig(cfg)
+	if err := saveConfig(cfg); err != nil {
+		return err
+	}
 	fmt.Printf("  %s%s✅ Profile '%s' deleted%s\n", Bold, Green, name, Reset)
+	return nil
 }
 
 // --- Dynamic Regex ---
@@ -386,27 +424,33 @@ func buildTagSearchGlob(prefix string) string {
 
 // --- Profile Resolution ---
 
-func resolveProfile(profileOverride string) Profile {
-	cfg := loadConfig()
+func resolveProfile(profileOverride string) (Profile, error) {
+	cfg, err := loadConfig()
+	if err != nil {
+		return Profile{}, err
+	}
 	name := cfg.Active
 	if profileOverride != "" {
 		name = profileOverride
 	}
 	p, ok := cfg.Profiles[name]
 	if !ok {
-		fatal(fmt.Sprintf("Profile '%s' not found. Run 'taghound config list' to see available profiles.", name))
+		return Profile{}, fmt.Errorf("profile '%s' not found. Run 'taghound config list' to see available profiles", name)
 	}
-	return p
+	return p, nil
 }
 
 // --- Tracker ---
 
-func runTracker(profileOverride string, dirtyMode bool) {
+func runTracker(profileOverride string, dirtyMode bool) error {
 	if err := gitCheck(); err != nil {
-		fatal("Not inside a Git repository.")
+		return fmt.Errorf("not inside a Git repository")
 	}
 
-	profile := resolveProfile(profileOverride)
+	profile, err := resolveProfile(profileOverride)
+	if err != nil {
+		return err
+	}
 	branchRe := buildBranchRegex(profile.BranchPrefix)
 	tagRe := buildTagRegex(profile.TagPrefix)
 	tagGlob := buildTagSearchGlob(profile.TagPrefix)
@@ -420,8 +464,8 @@ func runTracker(profileOverride string, dirtyMode bool) {
 	tags := findReleaseTags(tagRe, tagGlob)
 
 	if len(branches) == 0 && len(tags) == 0 {
-		fatal(fmt.Sprintf("No branches (%s) or tags (%s) found with the active profile",
-			buildBranchPattern(profile.BranchPrefix), buildTagPattern(profile.TagPrefix)))
+		return fmt.Errorf("no branches (%s) or tags (%s) found with the active profile",
+			buildBranchPattern(profile.BranchPrefix), buildTagPattern(profile.TagPrefix))
 	}
 
 	sortReleases(branches)
@@ -483,6 +527,7 @@ func runTracker(profileOverride string, dirtyMode bool) {
 	}
 
 	fmt.Println()
+	return nil
 }
 
 // --- Output ---
@@ -549,7 +594,7 @@ func gitFetch() error {
 }
 
 func findReleaseBranches(branchRe *regexp.Regexp) []releaseInfo {
-	out, err := gitOutput("git", "branch", "-r", "--format=%(refname:short)")
+	out, err := gitOutput("branch", "-r", "--format=%(refname:short)")
 	if err != nil {
 		return nil
 	}
@@ -575,7 +620,7 @@ func findReleaseBranches(branchRe *regexp.Regexp) []releaseInfo {
 }
 
 func findReleaseTags(tagRe *regexp.Regexp, tagGlob string) []releaseInfo {
-	out, err := gitOutput("git", "tag", "-l", tagGlob)
+	out, err := gitOutput("tag", "-l", tagGlob)
 	if err != nil {
 		return nil
 	}
@@ -606,7 +651,7 @@ func findReleaseTags(tagRe *regexp.Regexp, tagGlob string) []releaseInfo {
 func getRefInfo(ref, source string) releaseInfo {
 	const sep = "§§§"
 	format := fmt.Sprintf("%%h%s%%ai%s%%an%s%%s", sep, sep, sep)
-	out, _ := gitOutput("git", "log", "-1", "--format="+format, ref)
+	out, _ := gitOutput("log", "-1", "--format="+format, ref)
 
 	parts := strings.SplitN(out, sep, 4)
 	var commit, date, author, message string
@@ -632,7 +677,7 @@ func getRefInfo(ref, source string) releaseInfo {
 }
 
 func gitOutput(args ...string) (string, error) {
-	cmd := exec.Command(args[0], args[1:]...)
+	cmd := exec.Command("git", args...)
 	out, err := cmd.Output()
 	return strings.TrimSpace(string(out)), err
 }
