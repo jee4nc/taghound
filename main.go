@@ -87,7 +87,7 @@ func main() {
 		case "-h", "--help":
 			printUsage()
 			return
-		case "--dirty":
+		case "-d", "--dirty":
 			dirtyMode = true
 		case "--profile":
 			if i+1 >= len(args) {
@@ -100,11 +100,14 @@ func main() {
 		}
 	}
 
-	if len(positional) > 0 && positional[0] == "config" {
-		if err := handleConfig(positional[1:]); err != nil {
-			fatal(err.Error())
+	if len(positional) > 0 {
+		if positional[0] == "config" {
+			if err := handleConfig(positional[1:]); err != nil {
+				fatal(err.Error())
+			}
+			return
 		}
-		return
+		fatal(fmt.Sprintf("unknown command: '%s'. Run 'taghound -h' for options", positional[0]))
 	}
 
 	if err := runTracker(profileOverride, dirtyMode); err != nil {
@@ -117,7 +120,7 @@ func printUsage() {
 
 %sUsage:%s
   taghound                       Show releases (branches and tags)
-  taghound --dirty               Include orphan tags (no matching branch)
+  taghound --dirty               Show only orphan tags (no matching branch)
   taghound --profile <name>      Use a specific profile for this run
   taghound config <command>      Manage configuration profiles
 
@@ -132,13 +135,14 @@ func printUsage() {
 %sOptions:%s
   -h, --help                     Show this help
   -v, --version                  Show version
-  --dirty                        Include tags without a matching branch
+  -d, --dirty                    Show only tags without a matching branch
   --profile <name>               Use a temporary profile (does not change active)
 
 %sExamples:%s
   taghound                                            # uses active profile
   taghound config set deploy --branch deploy- --tag release-
   taghound config use deploy
+  taghound -d                                          # show dirty tags only
   taghound --profile default --dirty                   # temporary override
 `, Bold, Cyan, Reset, Bold, Reset, Bold, Reset, Bold, Reset, Bold, Reset)
 }
@@ -482,23 +486,6 @@ func runTracker(profileOverride string, dirtyMode bool) error {
 	fmt.Printf("%s%s  TagHound — Release Tracker%s\n", Bold, Cyan, Reset)
 	fmt.Printf("%s%s%s\n", Gray, strings.Repeat("─", 55), Reset)
 
-	if len(branches) > 0 {
-		latest := branches[len(branches)-1]
-		fmt.Println()
-		fmt.Printf("%s%s  🚀 Latest release on origin%s\n", Bold, Green, Reset)
-		fmt.Printf("%s%s%s\n", Gray, strings.Repeat("─", 55), Reset)
-		printBranchWithTag(latest, tagsByVersion)
-	}
-
-	if len(branches) > 1 {
-		fmt.Println()
-		fmt.Printf("%s%s  📦 Other releases on origin%s\n", Bold, Blue, Reset)
-		fmt.Printf("%s%s%s\n", Gray, strings.Repeat("─", 55), Reset)
-		for i := len(branches) - 2; i >= 0; i-- {
-			printBranchWithTag(branches[i], tagsByVersion)
-		}
-	}
-
 	if dirtyMode {
 		branchVersions := make(map[string]bool)
 		for _, b := range branches {
@@ -523,6 +510,23 @@ func runTracker(profileOverride string, dirtyMode bool) error {
 		} else {
 			fmt.Println()
 			fmt.Printf("  %s%s✓ All tags match a release branch%s\n", Bold, Green, Reset)
+		}
+	} else {
+		if len(branches) > 0 {
+			latest := branches[len(branches)-1]
+			fmt.Println()
+			fmt.Printf("%s%s  🚀 Latest release on origin%s\n", Bold, Green, Reset)
+			fmt.Printf("%s%s%s\n", Gray, strings.Repeat("─", 55), Reset)
+			printBranchWithTag(latest, tagsByVersion)
+		}
+
+		if len(branches) > 1 {
+			fmt.Println()
+			fmt.Printf("%s%s  📦 Other releases on origin%s\n", Bold, Blue, Reset)
+			fmt.Printf("%s%s%s\n", Gray, strings.Repeat("─", 55), Reset)
+			for i := len(branches) - 2; i >= 0; i-- {
+				printBranchWithTag(branches[i], tagsByVersion)
+			}
 		}
 	}
 
