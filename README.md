@@ -74,8 +74,8 @@ go build -o taghound .
 # Run in any Git repository
 taghound
 
-# Include orphan tags (tags without a matching branch)
-taghound --dirty
+# Show only orphan tags (tags without a matching branch)
+taghound --dirty    # or: taghound -d
 
 # Show version
 taghound --version
