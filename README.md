@@ -77,6 +77,9 @@ taghound
 # Show only orphan tags (tags without a matching branch)
 taghound --dirty    # or: taghound -d
 
+# Show what is deployed per country (Bitbucket Pipelines)
+taghound deploys
+
 # Show version
 taghound --version
 ```
@@ -126,6 +129,46 @@ taghound --profile default --dirty
 ```
 
 Configuration is stored at `~/.config/taghound/config.json`.
+
+## Deployments (Bitbucket Cloud)
+
+A new release branch doesn't mean it's live. `taghound deploys` asks Bitbucket Pipelines for the **last successful deploy** of each environment and places that exact commit in your release history — which branch it belongs to, which tag it matches, and whether something newer is waiting.
+
+```bash
+export BITBUCKET_TOKEN=...          # repository/workspace access token
+# export BITBUCKET_USERNAME=...     # only for app passwords / API tokens (Basic auth)
+
+taghound deploys --envs             # list the environments defined in this repo
+
+# {slug} → repo name, {country} → lowercase code, {COUNTRY} → uppercase, {workspace}
+taghound config country set CL --prod 'prd-{slug}-{country}' --qa 'qa-{slug}-{country}'
+taghound config country set PE --prod 'prd-{slug}-{country}'
+
+taghound deploys                    # results are cached for 5 minutes
+taghound deploys --refresh          # skip the cache
+```
+
+```
+  TagHound — Deployments  bitbucket.org/acme/push-config
+───────────────────────────────────────────────────────
+
+  Latest release:  origin/release-3.1  →  🏷️  v3.1.0
+
+  CL
+     QA    release-3.1            v3.1.0       a1b2c3d  2026-09-20 14:02
+           ✓ latest  pipeline #1410
+     PROD  release-3.0            v3.0.1+2     f4e5d6c  2026-09-10 10:31
+           ⚠ newer release origin/release-3.1 not deployed  pipeline #1398
+```
+
+| Status | Meaning |
+|--------|---------|
+| `✓ latest` | The deployed commit is the newest tag of the newest release line |
+| `● N commits not tagged` | Deployed from a branch head that has commits after its last tag |
+| `⚠ … not deployed` | A newer release branch, or a newer tag in the same line, exists |
+| `? commit not found locally` | The deployed commit isn't in your clone (deleted branch, force-push) |
+
+Environment names are templates so one global config works for every repo that follows the same convention. Optional settings in `config.json` under `bitbucket`: `auth_env` (token variable name, default `BITBUCKET_TOKEN`), `username`, `lookback` (deployments scanned per environment, default 40) and `cache_ttl_seconds` (default 300).
 
 ## Build from source
 

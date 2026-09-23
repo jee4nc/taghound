@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-TagHound is a single-file Go CLI tool that tracks Git releases by reading branches and tags with semantic versioning. Zero external dependencies — uses only Go stdlib. All logic lives in `main.go` (~660 lines) with tests in `main_test.go`.
+TagHound is a Go CLI tool that tracks Git releases by reading branches and tags with semantic versioning, and optionally shows what is deployed per environment via Bitbucket Pipelines. Zero external dependencies — uses only Go stdlib.
 
 ## Commands
 
@@ -18,12 +18,11 @@ go test -run TestSemverLess -v  # Run a single test
 
 ## Architecture
 
-**Single-file design** — `main.go` is organized into logical sections:
-
-- **Config system** (`~/.config/taghound/config.json`): Profiles define branch/tag prefix pairs (e.g., `release-` branches + `v` tags). Supports multiple profiles with `config set/use/list/show/delete` subcommands.
-- **Dynamic regex generation**: `buildBranchPattern()` and `buildTagPattern()` create regexes from profile prefixes using `regexp.QuoteMeta()` for safe escaping.
-- **Git operations**: All Git interaction via `os/exec` subprocess calls (`gitCheck`, `gitFetch`, `findReleaseBranches`, `findReleaseTags`, `getRefInfo`).
-- **Tracker** (`runTracker`): Orchestrates fetching, filtering, sorting, grouping tags by major.minor, and formatted output. `--dirty` flag shows orphan tags.
+- `main.go` — CLI parsing, config system (`~/.config/taghound/config.json`, profiles with branch/tag prefixes), dynamic regex generation (`buildBranchPattern`/`buildTagPattern` + `parseVersion`), Git subprocess helpers and the tracker (`runTracker`, `--dirty` for orphan tags).
+- `git.go` — remote URL parsing (`RepoInfo`) and helpers to place a commit in the release history (`highestMergedTag`, `oldestReleaseBranchContaining`, `countCommits`).
+- `deployments.go` — `DeploymentProvider` interface, `Deploy` type and the per-repo cache in `os.UserCacheDir()`.
+- `deployments_bitbucket.go` — Bitbucket Cloud provider (last successful deploy per environment, environment listing).
+- `deploys_cmd.go` — `taghound deploys` and `config country`: expands env name templates (`{slug}`, `{country}`), fetches deploys concurrently, resolves each deployed commit against local branches/tags and classifies it (`classifyDeploy`).
 
 Version is injected at build time via `-X main.Version=$(VERSION)` ldflags.
 
