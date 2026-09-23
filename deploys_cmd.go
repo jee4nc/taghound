@@ -28,6 +28,20 @@ type deployedRef struct {
 	Ahead   int // commits after Tag
 }
 
+// releaseMatcher recognizes the profile's release branches and tags.
+type releaseMatcher struct {
+	branchRe *regexp.Regexp
+	tagRe    *regexp.Regexp
+	tagGlob  string
+	lines    map[string]bool // major.minor of existing release branches; nil accepts any tag
+}
+
+// isReleaseTag reports whether v belongs to a known release line, so stray
+// tags like v3950.3950.1 (made from a feature branch) are ignored.
+func (m releaseMatcher) isReleaseTag(v semver) bool {
+	return m.lines == nil || m.lines[lineKey(v)]
+}
+
 type deployStatus int
 
 const (
@@ -35,10 +49,11 @@ const (
 	statusLatest
 	statusUntagged
 	statusBehind
+	statusFeature
 )
 
 type deployResult struct {
-	Deploy *Deploy
+	Lookup *DeployLookup
 	Err    error
 }
 
@@ -81,8 +96,8 @@ func fetchDeploys(ctx context.Context, provider DeploymentProvider, repo RepoInf
 	var missing []EnvironmentQuery
 	for _, q := range queries {
 		if cache != nil {
-			if d, ok := cache.Deploys[q.EnvName]; ok {
-				results[q.EnvName] = deployResult{Deploy: d}
+			if l, ok := cache.Deploys[q.EnvName]; ok && l != nil {
+				results[q.EnvName] = deployResult{Lookup: l}
 				cachedAt = cache.FetchedAt
 				continue
 			}
@@ -97,9 +112,9 @@ func fetchDeploys(ctx context.Context, provider DeploymentProvider, repo RepoInf
 	var wg sync.WaitGroup
 	for _, q := range missing {
 		wg.Go(func() {
-			d, err := provider.LastSuccessfulDeploy(ctx, q)
+			l, err := provider.LookupDeploy(ctx, q)
 			mu.Lock()
-			results[q.EnvName] = deployResult{Deploy: d, Err: err}
+			results[q.EnvName] = deployResult{Lookup: l, Err: err}
 			mu.Unlock()
 		})
 	}
@@ -107,11 +122,11 @@ func fetchDeploys(ctx context.Context, provider DeploymentProvider, repo RepoInf
 
 	// Keep the original FetchedAt on partial refreshes so stale entries still expire.
 	if cache == nil {
-		cache = &deployCacheEntry{FetchedAt: time.Now(), Deploys: make(map[string]*Deploy)}
+		cache = &deployCacheEntry{FetchedAt: time.Now(), Deploys: make(map[string]*DeployLookup)}
 	}
 	for _, q := range missing {
 		if r := results[q.EnvName]; r.Err == nil {
-			cache.Deploys[q.EnvName] = r.Deploy
+			cache.Deploys[q.EnvName] = r.Lookup
 		}
 	}
 	if err := saveDeployCache(repo, cache); err != nil {
@@ -121,32 +136,56 @@ func fetchDeploys(ctx context.Context, provider DeploymentProvider, repo RepoInf
 }
 
 // resolveDeployedRef locates a deployed commit within the local release branches and tags.
-func resolveDeployedRef(d *Deploy, branchRe, tagRe *regexp.Regexp, tagGlob string) deployedRef {
+func resolveDeployedRef(d *Deploy, m releaseMatcher) deployedRef {
 	r := deployedRef{Found: gitCommitExists(d.Commit)}
 
 	// Prefer the ref the pipeline ran on: it's what the team actually deployed.
-	if v, ok := parseVersion(branchRe, d.Branch); ok {
+	if v, ok := parseVersion(m.branchRe, d.Branch); ok {
 		r.Branch, r.Line, r.HasLine = d.Branch, v, true
-	} else if v, ok := parseVersion(tagRe, d.Branch); ok {
+	} else if v, ok := parseVersion(m.tagRe, d.Branch); ok && m.isReleaseTag(v) {
 		r.Line, r.HasLine = semver{Major: v.Major, Minor: v.Minor}, true
 	}
 	if !r.Found {
 		return r
 	}
 
-	if t, ok := highestMergedTag(d.Commit, tagRe, tagGlob); ok {
-		r.Tag, r.TagVer = t.Name, t.Version
-		r.Ahead = countCommits(t.Name, d.Commit)
+	// A commit deployed from a non-release branch (e.g. a feature branch in QA)
+	// only counts as a release if the pipeline ran on a tag or release branch.
+	if !r.HasLine && isReleaseLikeRef(d.Branch, m) {
+		if b, ok := oldestReleaseBranchContaining(d.Commit, m.branchRe); ok {
+			r.Branch, r.Line, r.HasLine = b.Name, b.Version, true
+		}
 	}
 
-	if !r.HasLine {
-		if b, ok := oldestReleaseBranchContaining(d.Commit, branchRe); ok {
-			r.Branch, r.Line, r.HasLine = b.Name, b.Version, true
-		} else if r.Tag != "" {
-			r.Line, r.HasLine = semver{Major: r.TagVer.Major, Minor: r.TagVer.Minor}, true
+	// Prefer a tag from the deployed release line: release-1.19 may have
+	// v1.20.x merged in, but v1.19.x is what describes it.
+	sameLine := func(v semver) bool { return m.isReleaseTag(v) && lineKey(v) == lineKey(r.Line) }
+	t, ok := releaseInfo{}, false
+	if r.HasLine {
+		t, ok = highestMergedTag(d.Commit, m.tagRe, m.tagGlob, sameLine)
+	}
+	if !ok {
+		t, ok = highestMergedTag(d.Commit, m.tagRe, m.tagGlob, m.isReleaseTag)
+	}
+	if ok {
+		r.Tag, r.TagVer = t.Name, t.Version
+		r.Ahead = countCommits(t.Name, d.Commit)
+		if !r.HasLine && isReleaseLikeRef(d.Branch, m) {
+			r.Line, r.HasLine = semver{Major: t.Version.Major, Minor: t.Version.Minor}, true
 		}
 	}
 	return r
+}
+
+// isReleaseLikeRef reports whether ref is empty (unknown) or matches the
+// profile's release branch/tag patterns.
+func isReleaseLikeRef(ref string, m releaseMatcher) bool {
+	if ref == "" {
+		return true
+	}
+	_, isBranch := parseVersion(m.branchRe, ref)
+	_, isTag := parseVersion(m.tagRe, ref)
+	return isBranch || isTag
 }
 
 // classifyDeploy compares a deployed ref against the newest release branch and
@@ -154,6 +193,9 @@ func resolveDeployedRef(d *Deploy, branchRe, tagRe *regexp.Regexp, tagGlob strin
 func classifyDeploy(r deployedRef, latestBranch, lineTag *releaseInfo) (deployStatus, string) {
 	if r.HasLine && latestBranch != nil && r.Line.Less(latestBranch.Version) {
 		return statusBehind, "newer release " + latestBranch.Name + " not deployed"
+	}
+	if !r.HasLine {
+		return statusFeature, "not a release branch"
 	}
 	if !r.Found {
 		return statusUnknown, "commit not found locally"
@@ -253,8 +295,18 @@ func runDeploys(args []string, profileOverride string) error {
 	if len(branches) > 0 {
 		latestBranch = &branches[len(branches)-1]
 	}
+	matcher := releaseMatcher{branchRe: branchRe, tagRe: tagRe, tagGlob: tagGlob}
+	if len(branches) > 0 {
+		matcher.lines = make(map[string]bool, len(branches))
+		for _, b := range branches {
+			matcher.lines[lineKey(b.Version)] = true
+		}
+	}
 	tagsByLine := make(map[string][]releaseInfo)
 	for _, t := range tags {
+		if !matcher.isReleaseTag(t.Version) {
+			continue
+		}
 		key := lineKey(t.Version)
 		tagsByLine[key] = append(tagsByLine[key], t)
 	}
@@ -277,9 +329,13 @@ func runDeploys(args []string, profileOverride string) error {
 	}
 
 	for _, c := range bb.Countries {
+		queries := deployQueries([]CountryConfig{c}, repo)
+		if allEnvsMissing(queries, results) {
+			continue // this repo doesn't deploy to that country
+		}
 		fmt.Printf("\n  %s%s%s%s\n", Bold, White, strings.ToUpper(c.Code), Reset)
-		for _, q := range deployQueries([]CountryConfig{c}, repo) {
-			printDeployRow(q, results[q.EnvName], branchRe, tagRe, tagGlob, latestBranch, tagsByLine, bb.Lookback)
+		for _, q := range queries {
+			printDeployRow(q, results[q.EnvName], matcher, latestBranch, tagsByLine)
 		}
 	}
 
@@ -290,7 +346,18 @@ func runDeploys(args []string, profileOverride string) error {
 	return nil
 }
 
-func printDeployRow(q EnvironmentQuery, res deployResult, branchRe, tagRe *regexp.Regexp, tagGlob string, latestBranch *releaseInfo, tagsByLine map[string][]releaseInfo, lookback int) {
+// allEnvsMissing reports whether none of a country's environments exist in the repo.
+func allEnvsMissing(queries []EnvironmentQuery, results map[string]deployResult) bool {
+	for _, q := range queries {
+		r := results[q.EnvName]
+		if r.Err != nil || r.Lookup == nil || !r.Lookup.EnvMissing {
+			return false
+		}
+	}
+	return len(queries) > 0
+}
+
+func printDeployRow(q EnvironmentQuery, res deployResult, m releaseMatcher, latestBranch *releaseInfo, tagsByLine map[string][]releaseInfo) {
 	tier := fmt.Sprintf("%-5s", strings.ToUpper(q.Tier))
 	prefix := fmt.Sprintf("     %s%s%s ", Cyan, tier, Reset)
 
@@ -298,16 +365,21 @@ func printDeployRow(q EnvironmentQuery, res deployResult, branchRe, tagRe *regex
 		fmt.Printf("%s%s✗ %s%s\n", prefix, Red, res.Err.Error(), Reset)
 		return
 	}
-	if res.Deploy == nil {
-		if lookback <= 0 {
-			lookback = 40
-		}
-		fmt.Printf("%s%sno successful deploy to %s in the last %d deployments%s\n", prefix, Gray, q.EnvName, lookback, Reset)
+	l := res.Lookup
+	switch {
+	case l == nil || l.EnvMissing:
+		fmt.Printf("%s%senvironment %s not defined in this repo%s\n", prefix, Gray, q.EnvName, Reset)
+		return
+	case l.Last == nil && l.Undeployed > 0:
+		fmt.Printf("%s%snever deployed%s %s— %d pipelines stopped before this step%s\n", prefix, Yellow, Reset, Gray, l.Undeployed, Reset)
+		return
+	case l.Last == nil:
+		fmt.Printf("%s%snever deployed%s\n", prefix, Gray, Reset)
 		return
 	}
 
-	d := res.Deploy
-	r := resolveDeployedRef(d, branchRe, tagRe, tagGlob)
+	d := l.Last
+	r := resolveDeployedRef(d, m)
 	var lineTag *releaseInfo
 	if r.HasLine {
 		if lt := tagsByLine[lineKey(r.Line)]; len(lt) > 0 {
@@ -331,7 +403,7 @@ func printDeployRow(q EnvironmentQuery, res deployResult, branchRe, tagRe *regex
 		}
 	}
 
-	icon, color := "?", Gray
+	icon, color, refColor := "?", Gray, Magenta
 	switch status {
 	case statusLatest:
 		icon, color = "✓", Green
@@ -339,11 +411,18 @@ func printDeployRow(q EnvironmentQuery, res deployResult, branchRe, tagRe *regex
 		icon, color = "●", Magenta
 	case statusBehind:
 		icon, color = "⚠", Yellow
+	case statusFeature:
+		// Feature branches are expected in QA, but PROD should only get releases.
+		icon, color, refColor = "●", Cyan, Cyan
+		if q.Tier == "prod" {
+			icon, color, refColor = "✗", Red, Red
+			detail = "not a release branch deployed to PROD"
+		}
 	}
 
 	fmt.Printf("%s%s%-22s%s %s%-12s%s %s%s%s  %s%s%s\n",
 		prefix,
-		Magenta, ref, Reset,
+		Bold+refColor, ref, Reset,
 		Green, tagLabel, Reset,
 		Yellow, d.ShortSha, Reset,
 		White, d.DeployedAt.Local().Format("2006-01-02 15:04"), Reset)

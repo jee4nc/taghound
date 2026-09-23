@@ -9,10 +9,14 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 )
 
-const bitbucketDefaultBaseURL = "https://api.bitbucket.org/2.0"
+const (
+	bitbucketDefaultBaseURL = "https://api.bitbucket.org/2.0"
+	defaultLookback         = 200
+)
 
 // BitbucketProvider implements DeploymentProvider against Bitbucket Cloud.
 type BitbucketProvider struct {
@@ -23,12 +27,15 @@ type BitbucketProvider struct {
 	Username   string
 	Lookback   int
 	HTTPClient *http.Client
+
+	envMu    sync.Mutex
+	envUUIDs map[string]string // lowercased env name -> uuid, loaded once
 }
 
 // NewBitbucketProvider builds a provider with sensible defaults.
 func NewBitbucketProvider(repo RepoInfo, token, username string, lookback int) *BitbucketProvider {
 	if lookback <= 0 {
-		lookback = 40
+		lookback = defaultLookback
 	}
 	return &BitbucketProvider{
 		BaseURL:    bitbucketDefaultBaseURL,
@@ -58,9 +65,10 @@ type bbStateStatus struct {
 }
 
 type bbState struct {
-	Type   string        `json:"type"`
-	Name   string        `json:"name"`
-	Status bbStateStatus `json:"status"`
+	Type        string        `json:"type"` // e.g. deployment_state_completed, deployment_state_undeployed
+	Name        string        `json:"name"`
+	Status      bbStateStatus `json:"status"`
+	CompletedOn time.Time     `json:"completed_on"`
 }
 
 type bbCommit struct {
@@ -119,7 +127,9 @@ type bbPipeline struct {
 
 // --- Public API ---
 
-func (b *BitbucketProvider) LastSuccessfulDeploy(ctx context.Context, q EnvironmentQuery) (*Deploy, error) {
+// LookupDeploy returns the last successful deploy of an environment, whatever
+// branch it came from, plus how many pipelines stopped before deploying to it.
+func (b *BitbucketProvider) LookupDeploy(ctx context.Context, q EnvironmentQuery) (*DeployLookup, error) {
 	if b.Workspace == "" || b.Slug == "" {
 		return nil, fmt.Errorf("bitbucket: workspace and repo slug required")
 	}
@@ -127,17 +137,30 @@ func (b *BitbucketProvider) LastSuccessfulDeploy(ctx context.Context, q Environm
 		return nil, fmt.Errorf("bitbucket: EnvName is required")
 	}
 
-	deployment, err := b.findLatestSuccessful(ctx, q.EnvName)
+	envUUID, err := b.environmentUUID(ctx, q.EnvName)
+	if err != nil {
+		return nil, err
+	}
+	if envUUID == "" {
+		return &DeployLookup{EnvMissing: true}, nil
+	}
+
+	deployment, undeployed, err := b.findLatestSuccessful(ctx, envUUID)
 	if err != nil {
 		return nil, err
 	}
 	if deployment == nil {
-		return nil, nil
+		return &DeployLookup{Undeployed: undeployed}, nil
 	}
 
-	branch, pipelineURL, err := b.resolvePipeline(ctx, deployment)
+	pipeline, err := b.resolvePipeline(ctx, deployment)
 	if err != nil {
 		return nil, err
+	}
+	pipelineURL := pipeline.Links.HTML.Href
+	buildNum := pipeline.BuildNumber
+	if buildNum == 0 {
+		buildNum = deployment.Deployable.Pipeline.BuildNumber
 	}
 
 	commit := deployment.Deployable.Commit.Hash
@@ -148,25 +171,29 @@ func (b *BitbucketProvider) LastSuccessfulDeploy(ctx context.Context, q Environm
 	if len(short) > 7 {
 		short = short[:7]
 	}
-
 	if pipelineURL == "" {
 		pipelineURL = deployment.Release.URL
 	}
+	deployedAt := deployment.State.CompletedOn
+	if deployedAt.IsZero() {
+		deployedAt = deployment.LastUpdateTime
+	}
 
-	return &Deploy{
-		Branch:      branch,
+	return &DeployLookup{Last: &Deploy{
+		Branch:      pipeline.Target.RefName,
 		Commit:      commit,
 		ShortSha:    short,
-		DeployedAt:  deployment.LastUpdateTime,
+		DeployedAt:  deployedAt,
 		PipelineURL: pipelineURL,
-		PipelineNum: deployment.Deployable.Pipeline.BuildNumber,
+		PipelineNum: buildNum,
 		EnvName:     deployment.Environment.Name,
 		State:       deployment.State.Status.Name,
-	}, nil
+	}}, nil
 }
 
 // BitbucketEnvironment is a deployment environment defined in the repository.
 type BitbucketEnvironment struct {
+	UUID string
 	Name string
 	Type string // Test, Staging or Production
 }
@@ -189,6 +216,7 @@ func (b *BitbucketProvider) ListEnvironments(ctx context.Context) ([]BitbucketEn
 		}
 		for _, raw := range body.Values {
 			var e struct {
+				UUID            string `json:"uuid"`
 				Name            string `json:"name"`
 				EnvironmentType struct {
 					Name string `json:"name"`
@@ -197,7 +225,7 @@ func (b *BitbucketProvider) ListEnvironments(ctx context.Context) ([]BitbucketEn
 			if err := json.Unmarshal(raw, &e); err != nil {
 				continue
 			}
-			envs = append(envs, BitbucketEnvironment{Name: e.Name, Type: e.EnvironmentType.Name})
+			envs = append(envs, BitbucketEnvironment{UUID: e.UUID, Name: e.Name, Type: e.EnvironmentType.Name})
 		}
 		u = body.Next
 	}
@@ -206,45 +234,72 @@ func (b *BitbucketProvider) ListEnvironments(ctx context.Context) ([]BitbucketEn
 
 // --- Internal HTTP helpers ---
 
-func (b *BitbucketProvider) findLatestSuccessful(ctx context.Context, envName string) (*bbDeployment, error) {
-	u := fmt.Sprintf("%s/repositories/%s/%s/deployments/?sort=-last_update_time&pagelen=50",
+// environmentUUID maps an environment name to its UUID ("" if it doesn't exist).
+// The deployments API only filters by UUID, so the list is loaded once per run.
+func (b *BitbucketProvider) environmentUUID(ctx context.Context, name string) (string, error) {
+	b.envMu.Lock()
+	defer b.envMu.Unlock()
+	if b.envUUIDs == nil {
+		envs, err := b.ListEnvironments(ctx)
+		if err != nil {
+			return "", err
+		}
+		b.envUUIDs = make(map[string]string, len(envs))
+		for _, e := range envs {
+			b.envUUIDs[strings.ToLower(e.Name)] = e.UUID
+		}
+	}
+	return b.envUUIDs[strings.ToLower(name)], nil
+}
+
+// findLatestSuccessful walks an environment's deployments newest first and
+// returns the first successful one. undeployed counts pipelines that created
+// the deployment but never ran the step (e.g. a manual PROD step).
+func (b *BitbucketProvider) findLatestSuccessful(ctx context.Context, envUUID string) (latest *bbDeployment, undeployed int, err error) {
+	u := fmt.Sprintf("%s/repositories/%s/%s/deployments/?%s",
 		b.BaseURL,
 		url.PathEscape(b.Workspace),
-		url.PathEscape(b.Slug))
+		url.PathEscape(b.Slug),
+		url.Values{
+			"environment": {envUUID},
+			"sort":        {"-state.completed_on"},
+			"pagelen":     {"100"},
+		}.Encode())
 
 	seen := 0
-	maxPages := 5
-	for page := 0; page < maxPages && u != "" && seen < b.Lookback; page++ {
+	for u != "" && seen < b.Lookback {
 		var body bbPage
 		if err := b.doJSON(ctx, u, &body); err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 		for _, raw := range body.Values {
 			seen++
 			if seen > b.Lookback {
-				return nil, nil
+				break
 			}
 			var d bbDeployment
 			if err := json.Unmarshal(raw, &d); err != nil {
 				continue
 			}
-			if !strings.EqualFold(d.Environment.Name, envName) {
+			if d.State.Type == "deployment_state_undeployed" {
+				undeployed++
 				continue
 			}
-			if !strings.EqualFold(d.State.Status.Name, "SUCCESSFUL") {
-				continue
+			if strings.EqualFold(d.State.Status.Name, "SUCCESSFUL") {
+				return &d, undeployed, nil
 			}
-			return &d, nil
 		}
 		u = body.Next
 	}
-	return nil, nil
+	return nil, undeployed, nil
 }
 
-func (b *BitbucketProvider) resolvePipeline(ctx context.Context, d *bbDeployment) (branch, htmlURL string, err error) {
+// resolvePipeline fetches the pipeline behind a deployment, which carries the
+// branch it ran on and its build number. Returns a zero value if unknown.
+func (b *BitbucketProvider) resolvePipeline(ctx context.Context, d *bbDeployment) (bbPipeline, error) {
 	uuid := d.Deployable.Pipeline.UUID
 	if uuid == "" {
-		return "", "", nil
+		return bbPipeline{}, nil
 	}
 	u := fmt.Sprintf("%s/repositories/%s/%s/pipelines/%s",
 		b.BaseURL,
@@ -254,9 +309,9 @@ func (b *BitbucketProvider) resolvePipeline(ctx context.Context, d *bbDeployment
 
 	var p bbPipeline
 	if err := b.doJSON(ctx, u, &p); err != nil {
-		return "", "", err
+		return bbPipeline{}, err
 	}
-	return p.Target.RefName, p.Links.HTML.Href, nil
+	return p, nil
 }
 
 func (b *BitbucketProvider) doJSON(ctx context.Context, rawURL string, out any) error {

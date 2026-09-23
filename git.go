@@ -100,7 +100,8 @@ func gitCommitExists(sha string) bool {
 }
 
 // highestMergedTag returns the highest release tag reachable from commit.
-func highestMergedTag(commit string, tagRe *regexp.Regexp, tagGlob string) (releaseInfo, bool) {
+// accept filters out tags that don't belong to a release line.
+func highestMergedTag(commit string, tagRe *regexp.Regexp, tagGlob string, accept func(semver) bool) (releaseInfo, bool) {
 	out, err := gitOutput("tag", "--merged", commit, "-l", tagGlob)
 	if err != nil {
 		return releaseInfo{}, false
@@ -110,7 +111,7 @@ func highestMergedTag(commit string, tagRe *regexp.Regexp, tagGlob string) (rele
 	for _, line := range strings.Split(out, "\n") {
 		line = strings.TrimSpace(line)
 		v, ok := parseVersion(tagRe, line)
-		if !ok {
+		if !ok || (accept != nil && !accept(v)) {
 			continue
 		}
 		if !found || best.Version.Less(v) {

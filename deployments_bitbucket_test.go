@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -28,16 +29,21 @@ func newFakeBitbucket(t *testing.T, handler http.HandlerFunc) (*httptest.Server,
 	return srv, p
 }
 
-func deploymentJSON(envName, status, commit, pipelineUUID string, buildNum int, when time.Time) map[string]any {
+func deploymentJSON(envName, status, commit, pipelineUUID string, when time.Time) map[string]any {
+	state := map[string]any{
+		"type":         "deployment_state_completed",
+		"name":         "COMPLETED",
+		"status":       map[string]any{"name": status},
+		"completed_on": when.Format(time.RFC3339),
+	}
+	if status == "UNDEPLOYED" {
+		state = map[string]any{"type": "deployment_state_undeployed", "name": "UNDEPLOYED"}
+	}
 	return map[string]any{
-		"uuid": "{deploy-" + envName + "}",
-		"state": map[string]any{
-			"type":   "deployment_state_completed",
-			"name":   "COMPLETED",
-			"status": map[string]any{"name": status},
-		},
+		"uuid":  "{deploy-" + envName + "}",
+		"state": state,
 		"environment": map[string]any{
-			"uuid": "{env-" + envName + "}",
+			"uuid": envUUID(envName),
 			"name": envName,
 		},
 		"release": map[string]any{
@@ -45,14 +51,58 @@ func deploymentJSON(envName, status, commit, pipelineUUID string, buildNum int, 
 			"commit": map[string]any{"hash": commit},
 		},
 		"deployable": map[string]any{
-			"pipeline": map[string]any{
-				"uuid":         pipelineUUID,
-				"build_number": buildNum,
-				"commit":       map[string]any{"hash": commit},
-			},
-			"commit": map[string]any{"hash": commit},
+			"pipeline": map[string]any{"uuid": pipelineUUID},
+			"commit":   map[string]any{"hash": commit},
 		},
-		"last_update_time": when.Format(time.RFC3339),
+	}
+}
+
+func envUUID(name string) string { return "{env-" + name + "}" }
+
+// fakeAPI imitates the real Bitbucket endpoints used by the provider:
+// environments, deployments filtered by environment UUID and sorted by
+// -state.completed_on (any other sort is a 400, like the real API), and pipelines.
+type fakeAPI struct {
+	envs        []string
+	deployments []map[string]any // newest first
+	pipelines   map[string]map[string]any
+}
+
+func (f *fakeAPI) handler(t *testing.T) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/environments/"):
+			var values []any
+			for _, n := range f.envs {
+				values = append(values, map[string]any{"uuid": envUUID(n), "name": n, "environment_type": map[string]any{"name": "Production"}})
+			}
+			writeJSON(t, w, map[string]any{"values": values})
+		case strings.HasSuffix(r.URL.Path, "/deployments/"):
+			if s := r.URL.Query().Get("sort"); s != "" && s != "-state.completed_on" && s != "-state.started_on" {
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write([]byte(`{"message":"Invalid sort attribute provided"}`))
+				return
+			}
+			env := r.URL.Query().Get("environment")
+			values := []any{}
+			for _, d := range f.deployments {
+				if d["environment"].(map[string]any)["uuid"] == env {
+					values = append(values, d)
+				}
+			}
+			writeJSON(t, w, map[string]any{"values": values})
+		case strings.Contains(r.URL.Path, "/pipelines/"):
+			uuid := r.URL.Path[strings.LastIndex(r.URL.Path, "/")+1:]
+			p, ok := f.pipelines[uuid]
+			if !ok {
+				http.NotFound(w, r)
+				return
+			}
+			writeJSON(t, w, p)
+		default:
+			t.Errorf("unexpected path: %s", r.URL.Path)
+			http.NotFound(w, r)
+		}
 	}
 }
 
@@ -88,194 +138,187 @@ func writeJSON(t *testing.T, w http.ResponseWriter, v any) {
 
 // --- tests ---
 
-func TestBitbucketLastSuccessfulDeployHappyPath(t *testing.T) {
+func TestBitbucketLookupDeployHappyPath(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
-	pipelineUUID := "{pipe-1409}"
-
+	api := &fakeAPI{
+		envs: []string{"prd-push-config-cl"},
+		deployments: []map[string]any{
+			deploymentJSON("prd-push-config-cl", "SUCCESSFUL", "5c02bed1234", "{pipe-1409}", now),
+		},
+		pipelines: map[string]map[string]any{"{pipe-1409}": pipelineJSON("{pipe-1409}", 1409, "release-1.4", "5c02bed1234")},
+	}
 	_, p := newFakeBitbucket(t, func(w http.ResponseWriter, r *http.Request) {
 		if !strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ") {
 			t.Errorf("expected Bearer auth, got %q", r.Header.Get("Authorization"))
 		}
-		switch {
-		case strings.Contains(r.URL.Path, "/deployments/"):
-			writeJSON(t, w, map[string]any{
-				"values": []any{
-					deploymentJSON("prd-push-config-cl", "SUCCESSFUL", "5c02bed1234", pipelineUUID, 1409, now),
-				},
-			})
-		case strings.Contains(r.URL.Path, "/pipelines/"):
-			writeJSON(t, w, pipelineJSON(pipelineUUID, 1409, "release-1.4", "5c02bed1234"))
-		default:
-			t.Errorf("unexpected path: %s", r.URL.Path)
-			http.NotFound(w, r)
-		}
+		api.handler(t)(w, r)
 	})
 
-	d, err := p.LastSuccessfulDeploy(context.Background(), EnvironmentQuery{
-		CountryCode: "CL",
-		EnvName:     "prd-push-config-cl",
-		Tier:        "prod",
-	})
+	l, err := p.LookupDeploy(context.Background(), EnvironmentQuery{CountryCode: "CL", EnvName: "prd-push-config-cl", Tier: "prod"})
 	if err != nil {
-		t.Fatalf("LastSuccessfulDeploy: %v", err)
+		t.Fatalf("LookupDeploy: %v", err)
 	}
+	d := l.Last
 	if d == nil {
 		t.Fatal("expected deploy, got nil")
 	}
-	if d.Branch != "release-1.4" {
-		t.Errorf("Branch = %q, want release-1.4", d.Branch)
-	}
-	if d.Commit != "5c02bed1234" {
-		t.Errorf("Commit = %q", d.Commit)
-	}
-	if d.ShortSha != "5c02bed" {
-		t.Errorf("ShortSha = %q, want 5c02bed", d.ShortSha)
+	if d.Branch != "release-1.4" || d.Commit != "5c02bed1234" || d.ShortSha != "5c02bed" {
+		t.Errorf("unexpected deploy: %+v", d)
 	}
 	if d.PipelineNum != 1409 {
-		t.Errorf("PipelineNum = %d, want 1409", d.PipelineNum)
+		t.Errorf("PipelineNum = %d, want 1409 (taken from the pipeline)", d.PipelineNum)
 	}
-	if d.State != "SUCCESSFUL" {
-		t.Errorf("State = %q", d.State)
-	}
-	if !d.DeployedAt.Equal(now) {
-		t.Errorf("DeployedAt = %v, want %v", d.DeployedAt, now)
+	if d.State != "SUCCESSFUL" || !d.DeployedAt.Equal(now) {
+		t.Errorf("State/DeployedAt = %q/%v, want SUCCESSFUL/%v", d.State, d.DeployedAt, now)
 	}
 }
 
-func TestBitbucketFiltersNonMatchingEnv(t *testing.T) {
+func TestBitbucketLookupFiltersByEnvironment(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
-	pipelineUUID := "{pipe-cl}"
+	api := &fakeAPI{
+		envs: []string{"qa-push-config-cl", "prd-push-config-cl"},
+		deployments: []map[string]any{
+			deploymentJSON("qa-push-config-cl", "SUCCESSFUL", "qa1234", "{pipe-qa}", now),
+			deploymentJSON("prd-push-config-cl", "SUCCESSFUL", "prd1234", "{pipe-prd}", now.Add(-time.Hour)),
+		},
+		pipelines: map[string]map[string]any{"{pipe-prd}": pipelineJSON("{pipe-prd}", 7, "release-1.4", "prd1234")},
+	}
+	_, p := newFakeBitbucket(t, api.handler(t))
 
-	_, p := newFakeBitbucket(t, func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case strings.Contains(r.URL.Path, "/deployments/"):
-			writeJSON(t, w, map[string]any{
-				"values": []any{
-					deploymentJSON("qa-push-config-cl", "SUCCESSFUL", "aaa1234", "{pipe-qa}", 1410, now),
-					deploymentJSON("prd-push-config-pe", "SUCCESSFUL", "bbb1234", "{pipe-pe}", 1411, now),
-					deploymentJSON("prd-push-config-cl", "SUCCESSFUL", "ccc1234", pipelineUUID, 1409, now.Add(-1*time.Hour)),
-				},
-			})
-		case strings.Contains(r.URL.Path, "/pipelines/"):
-			writeJSON(t, w, pipelineJSON(pipelineUUID, 1409, "release-1.4", "ccc1234"))
-		}
-	})
-
-	d, err := p.LastSuccessfulDeploy(context.Background(), EnvironmentQuery{
-		EnvName: "prd-push-config-cl",
-	})
+	l, err := p.LookupDeploy(context.Background(), EnvironmentQuery{EnvName: "PRD-push-config-cl"})
 	if err != nil {
-		t.Fatalf("LastSuccessfulDeploy: %v", err)
+		t.Fatalf("LookupDeploy: %v", err)
 	}
-	if d == nil {
-		t.Fatal("expected deploy")
-	}
-	if d.EnvName != "prd-push-config-cl" {
-		t.Errorf("EnvName = %q", d.EnvName)
-	}
-	if d.Commit != "ccc1234" {
-		t.Errorf("Commit = %q, want ccc1234", d.Commit)
+	if l.Last == nil || l.Last.Commit != "prd1234" {
+		t.Fatalf("expected prd1234, got %+v", l.Last)
 	}
 }
 
-func TestBitbucketSkipsFailedDeploys(t *testing.T) {
+func TestBitbucketLookupSkipsFailedAndUndeployed(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
-	pipelineUUID := "{pipe-ok}"
+	api := &fakeAPI{
+		envs: []string{"prd-push-config-cl"},
+		deployments: []map[string]any{
+			deploymentJSON("prd-push-config-cl", "FAILED", "badcommit", "{pipe-bad}", now),
+			deploymentJSON("prd-push-config-cl", "SUCCESSFUL", "goodcommit", "{pipe-ok}", now.Add(-time.Hour)),
+		},
+		pipelines: map[string]map[string]any{"{pipe-ok}": pipelineJSON("{pipe-ok}", 9, "release-1.4", "goodcommit")},
+	}
+	// Undeployed entries have no completed_on and are listed first by the real API.
+	api.deployments = append([]map[string]any{deploymentJSON("prd-push-config-cl", "UNDEPLOYED", "newer", "{pipe-new}", now)}, api.deployments...)
+	_, p := newFakeBitbucket(t, api.handler(t))
 
-	_, p := newFakeBitbucket(t, func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case strings.Contains(r.URL.Path, "/deployments/"):
-			writeJSON(t, w, map[string]any{
-				"values": []any{
-					deploymentJSON("prd-push-config-cl", "FAILED", "badcommit", "{pipe-bad}", 1410, now),
-					deploymentJSON("prd-push-config-cl", "SUCCESSFUL", "goodcommit", pipelineUUID, 1409, now.Add(-1*time.Hour)),
-				},
-			})
-		case strings.Contains(r.URL.Path, "/pipelines/"):
-			writeJSON(t, w, pipelineJSON(pipelineUUID, 1409, "release-1.4", "goodcommit"))
-		}
-	})
-
-	d, err := p.LastSuccessfulDeploy(context.Background(), EnvironmentQuery{EnvName: "prd-push-config-cl"})
+	l, err := p.LookupDeploy(context.Background(), EnvironmentQuery{EnvName: "prd-push-config-cl"})
 	if err != nil {
-		t.Fatalf("LastSuccessfulDeploy: %v", err)
+		t.Fatalf("LookupDeploy: %v", err)
 	}
-	if d == nil || d.Commit != "goodcommit" {
-		t.Fatalf("expected goodcommit, got %+v", d)
+	if l.Last == nil || l.Last.Commit != "goodcommit" {
+		t.Fatalf("expected goodcommit, got %+v", l.Last)
 	}
 }
 
-func TestBitbucketPaginationNext(t *testing.T) {
-	now := time.Now().UTC().Truncate(time.Second)
-	pipelineUUID := "{pipe-page2}"
+func TestBitbucketLookupNeverDeployed(t *testing.T) {
+	now := time.Now().UTC()
+	api := &fakeAPI{
+		envs: []string{"prd-push-config-cl"},
+		deployments: []map[string]any{
+			deploymentJSON("prd-push-config-cl", "UNDEPLOYED", "a", "{p1}", now),
+			deploymentJSON("prd-push-config-cl", "UNDEPLOYED", "b", "{p2}", now),
+		},
+	}
+	_, p := newFakeBitbucket(t, api.handler(t))
 
+	l, err := p.LookupDeploy(context.Background(), EnvironmentQuery{EnvName: "prd-push-config-cl"})
+	if err != nil {
+		t.Fatalf("LookupDeploy: %v", err)
+	}
+	if l.Last != nil || l.Undeployed != 2 || l.EnvMissing {
+		t.Errorf("unexpected lookup: %+v", l)
+	}
+}
+
+func TestBitbucketLookupMissingEnvironment(t *testing.T) {
+	api := &fakeAPI{envs: []string{"prd-push-config-cl"}}
+	_, p := newFakeBitbucket(t, api.handler(t))
+
+	l, err := p.LookupDeploy(context.Background(), EnvironmentQuery{EnvName: "prd-push-config-pe"})
+	if err != nil {
+		t.Fatalf("LookupDeploy: %v", err)
+	}
+	if !l.EnvMissing {
+		t.Errorf("expected EnvMissing, got %+v", l)
+	}
+}
+
+func TestBitbucketEnvironmentsLoadedOnce(t *testing.T) {
+	var envCalls atomic.Int32
+	api := &fakeAPI{envs: []string{"a", "b"}}
+	_, p := newFakeBitbucket(t, func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/environments/") {
+			envCalls.Add(1)
+		}
+		api.handler(t)(w, r)
+	})
+	for _, env := range []string{"a", "b", "a"} {
+		if _, err := p.LookupDeploy(context.Background(), EnvironmentQuery{EnvName: env}); err != nil {
+			t.Fatalf("LookupDeploy(%s): %v", env, err)
+		}
+	}
+	if n := envCalls.Load(); n != 1 {
+		t.Errorf("environments fetched %d times, want 1", n)
+	}
+}
+
+func TestBitbucketLookupPagination(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
 	var srvURL string
-	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
+		case strings.HasSuffix(r.URL.Path, "/environments/"):
+			writeJSON(t, w, map[string]any{"values": []any{map[string]any{"uuid": envUUID("prd"), "name": "prd"}}})
 		case strings.Contains(r.URL.Path, "/pipelines/"):
-			writeJSON(t, w, pipelineJSON(pipelineUUID, 1405, "release-1.3", "page2sha"))
-		case strings.Contains(r.URL.RawQuery, "page=2"):
-			writeJSON(t, w, map[string]any{
-				"values": []any{
-					deploymentJSON("prd-push-config-cl", "SUCCESSFUL", "page2sha", pipelineUUID, 1405, now),
-				},
-			})
+			writeJSON(t, w, pipelineJSON("{pipe-2}", 2, "release-1.3", "page2sha"))
+		case r.URL.Query().Get("page") == "2":
+			writeJSON(t, w, map[string]any{"values": []any{deploymentJSON("prd", "SUCCESSFUL", "page2sha", "{pipe-2}", now)}})
 		default:
 			writeJSON(t, w, map[string]any{
-				"next": srvURL + "/repositories/ws/repo/deployments/?page=2",
-				"values": []any{
-					deploymentJSON("qa-push-config-cl", "SUCCESSFUL", "qacommit", "{qa-pipe}", 1410, now),
-				},
+				"next":   srvURL + "/repositories/ws/repo/deployments/?page=2",
+				"values": []any{deploymentJSON("prd", "FAILED", "failsha", "{pipe-1}", now)},
 			})
 		}
-	})
-	srv := httptest.NewServer(handler)
+	}))
 	defer srv.Close()
 	srvURL = srv.URL
 
-	p := NewBitbucketProvider(RepoInfo{Workspace: "ws", Slug: "repo"}, "t", "", 40)
+	p := NewBitbucketProvider(RepoInfo{Workspace: "ws", Slug: "repo"}, "t", "", 0)
 	p.BaseURL = srv.URL
 	p.HTTPClient = srv.Client()
 
-	d, err := p.LastSuccessfulDeploy(context.Background(), EnvironmentQuery{EnvName: "prd-push-config-cl"})
+	l, err := p.LookupDeploy(context.Background(), EnvironmentQuery{EnvName: "prd"})
 	if err != nil {
-		t.Fatalf("LastSuccessfulDeploy: %v", err)
+		t.Fatalf("LookupDeploy: %v", err)
 	}
-	if d == nil || d.Commit != "page2sha" {
-		t.Fatalf("expected page2sha, got %+v", d)
-	}
-}
-
-func TestBitbucketReturnsNilWhenNotFound(t *testing.T) {
-	_, p := newFakeBitbucket(t, func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(t, w, map[string]any{"values": []any{}})
-	})
-	d, err := p.LastSuccessfulDeploy(context.Background(), EnvironmentQuery{EnvName: "prd-push-config-cl"})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if d != nil {
-		t.Errorf("expected nil deploy, got %+v", d)
+	if l.Last == nil || l.Last.Commit != "page2sha" {
+		t.Fatalf("expected page2sha, got %+v", l.Last)
 	}
 }
 
 func TestBitbucketLookbackCap(t *testing.T) {
-	now := time.Now().UTC().Truncate(time.Second)
-	var values []any
+	now := time.Now().UTC()
+	api := &fakeAPI{envs: []string{"prd"}}
 	for i := range 10 {
-		values = append(values, deploymentJSON("other-env", "SUCCESSFUL", fmt.Sprintf("sha%d", i), "{pipe}", 1000+i, now))
+		api.deployments = append(api.deployments, deploymentJSON("prd", "FAILED", fmt.Sprintf("sha%d", i), "{pipe}", now))
 	}
-	_, p := newFakeBitbucket(t, func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(t, w, map[string]any{"values": values})
-	})
+	api.deployments = append(api.deployments, deploymentJSON("prd", "SUCCESSFUL", "old", "{pipe-old}", now))
+	_, p := newFakeBitbucket(t, api.handler(t))
 	p.Lookback = 3
 
-	d, err := p.LastSuccessfulDeploy(context.Background(), EnvironmentQuery{EnvName: "prd-push-config-cl"})
+	l, err := p.LookupDeploy(context.Background(), EnvironmentQuery{EnvName: "prd"})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if d != nil {
-		t.Errorf("expected nil (lookback exhausted), got %+v", d)
+	if l.Last != nil {
+		t.Errorf("expected nil (lookback exhausted), got %+v", l.Last)
 	}
 }
 
@@ -284,7 +327,7 @@ func TestBitbucketHTTPError(t *testing.T) {
 		w.WriteHeader(http.StatusUnauthorized)
 		_, _ = w.Write([]byte(`{"error":{"message":"bad token"}}`))
 	})
-	_, err := p.LastSuccessfulDeploy(context.Background(), EnvironmentQuery{EnvName: "prd-push-config-cl"})
+	_, err := p.LookupDeploy(context.Background(), EnvironmentQuery{EnvName: "prd-push-config-cl"})
 	if err == nil {
 		t.Fatal("expected error on 401")
 	}
@@ -325,7 +368,7 @@ func TestBitbucketMissingCreds(t *testing.T) {
 
 func TestBitbucketMissingEnvName(t *testing.T) {
 	p := NewBitbucketProvider(RepoInfo{Workspace: "ws", Slug: "repo"}, "t", "", 40)
-	_, err := p.LastSuccessfulDeploy(context.Background(), EnvironmentQuery{})
+	_, err := p.LookupDeploy(context.Background(), EnvironmentQuery{})
 	if err == nil {
 		t.Fatal("expected error with missing EnvName")
 	}
@@ -333,7 +376,7 @@ func TestBitbucketMissingEnvName(t *testing.T) {
 
 func TestBitbucketMissingWorkspace(t *testing.T) {
 	p := NewBitbucketProvider(RepoInfo{}, "t", "", 40)
-	_, err := p.LastSuccessfulDeploy(context.Background(), EnvironmentQuery{EnvName: "x"})
+	_, err := p.LookupDeploy(context.Background(), EnvironmentQuery{EnvName: "x"})
 	if err == nil {
 		t.Fatal("expected error with missing workspace")
 	}
@@ -346,7 +389,7 @@ func TestBitbucketContextCancellation(t *testing.T) {
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
-	_, err := p.LastSuccessfulDeploy(ctx, EnvironmentQuery{EnvName: "prd-push-config-cl"})
+	_, err := p.LookupDeploy(ctx, EnvironmentQuery{EnvName: "prd-push-config-cl"})
 	if err == nil {
 		t.Fatal("expected context error")
 	}

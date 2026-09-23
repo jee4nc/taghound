@@ -44,8 +44,8 @@ func TestDeployCacheTTL(t *testing.T) {
 
 	entry := &deployCacheEntry{
 		FetchedAt: time.Now(),
-		Deploys: map[string]*Deploy{
-			"prd-push-config-cl": {Branch: "release-1.4", Commit: "abc"},
+		Deploys: map[string]*DeployLookup{
+			"prd-push-config-cl": {Last: &Deploy{Branch: "release-1.4", Commit: "abc"}},
 		},
 	}
 	if err := saveDeployCache(repo, entry); err != nil {
@@ -60,7 +60,7 @@ func TestDeployCacheTTL(t *testing.T) {
 	if loaded == nil {
 		t.Fatal("expected cache hit, got nil")
 	}
-	if loaded.Deploys["prd-push-config-cl"].Branch != "release-1.4" {
+	if loaded.Deploys["prd-push-config-cl"].Last.Branch != "release-1.4" {
 		t.Errorf("unexpected branch: %+v", loaded.Deploys)
 	}
 

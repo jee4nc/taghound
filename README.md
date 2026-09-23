@@ -161,14 +161,21 @@ taghound deploys --refresh          # skip the cache
            ⚠ newer release origin/release-3.1 not deployed  pipeline #1398
 ```
 
+The last successful deploy is what's in the environment, whatever branch it came from.
+
 | Status | Meaning |
 |--------|---------|
 | `✓ latest` | The deployed commit is the newest tag of the newest release line |
-| `● N commits not tagged` | Deployed from a branch head that has commits after its last tag |
+| `● N commits not tagged` | Deployed from a release branch that has commits after its last tag |
 | `⚠ … not deployed` | A newer release branch, or a newer tag in the same line, exists |
+| `● not a release branch` | Deployed from a feature/other branch — normal in QA |
+| `✗ not a release branch deployed to PROD` | Same, but in PROD (shown in red) |
+| `never deployed — N pipelines stopped before this step` | Pipelines reached the (manual) step but nobody ran it |
 | `? commit not found locally` | The deployed commit isn't in your clone (deleted branch, force-push) |
 
-Environment names are templates so one global config works for every repo that follows the same convention. Optional settings in `config.json` under `bitbucket`: `auth_env` (token variable name, default `BITBUCKET_TOKEN`), `username`, `lookback` (deployments scanned per environment, default 40) and `cache_ttl_seconds` (default 300).
+Countries whose environments don't exist in the repo are hidden. Tags outside the release lines of your branches (e.g. `v3950.3950.1` created from a feature branch) are ignored.
+
+Environment names are templates so one global config works for every repo that follows the same convention. Optional settings in `config.json` under `bitbucket`: `auth_env` (token variable name, default `BITBUCKET_TOKEN`), `username`, `lookback` (deployments scanned per environment, default 200) and `cache_ttl_seconds` (default 300).
 
 ## Build from source
 

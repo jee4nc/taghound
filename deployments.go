@@ -30,17 +30,24 @@ type EnvironmentQuery struct {
 	Tier        string // "prod" or "qa"
 }
 
+// DeployLookup is what a provider knows about an environment.
+type DeployLookup struct {
+	Last       *Deploy `json:"last,omitempty"`       // last successful deploy, nil if none
+	Undeployed int     `json:"undeployed,omitempty"` // when Last is nil: pipelines that reached the step but never ran it
+	EnvMissing bool    `json:"envMissing,omitempty"` // environment isn't defined in the repo
+}
+
 // DeploymentProvider abstracts CI/CD providers.
 type DeploymentProvider interface {
-	LastSuccessfulDeploy(ctx context.Context, q EnvironmentQuery) (*Deploy, error)
+	LookupDeploy(ctx context.Context, q EnvironmentQuery) (*DeployLookup, error)
 	Name() string
 }
 
 // --- Cache ---
 
 type deployCacheEntry struct {
-	FetchedAt time.Time          `json:"fetchedAt"`
-	Deploys   map[string]*Deploy `json:"deploys"` // keyed by env name
+	FetchedAt time.Time                `json:"fetchedAt"`
+	Deploys   map[string]*DeployLookup `json:"deploys"` // keyed by env name
 }
 
 func cacheFilePath(repo RepoInfo) (string, error) {
@@ -49,7 +56,7 @@ func cacheFilePath(repo RepoInfo) (string, error) {
 		return "", fmt.Errorf("could not determine cache dir: %w", err)
 	}
 	sum := sha1.Sum([]byte(repo.Host + "/" + repo.Workspace + "/" + repo.Slug))
-	name := "deployments-" + hex.EncodeToString(sum[:8]) + ".json"
+	name := "deployments-v2-" + hex.EncodeToString(sum[:8]) + ".json"
 	return filepath.Join(dir, "taghound", name), nil
 }
 
@@ -74,7 +81,7 @@ func loadDeployCache(repo RepoInfo, ttl time.Duration) (*deployCacheEntry, error
 		return nil, nil
 	}
 	if e.Deploys == nil {
-		e.Deploys = make(map[string]*Deploy)
+		e.Deploys = make(map[string]*DeployLookup)
 	}
 	return &e, nil
 }
