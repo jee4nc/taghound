@@ -373,3 +373,72 @@ func TestBitbucketListEnvironments(t *testing.T) {
 		t.Errorf("unexpected envs: %+v", envs)
 	}
 }
+
+func TestBitbucketHTTPErrorMessages(t *testing.T) {
+	tests := []struct {
+		name     string
+		status   int
+		body     string
+		username string
+		want     string
+		notWant  string
+	}{
+		{
+			name:    "missing scope",
+			status:  http.StatusForbidden,
+			body:    `{"type":"error","error":{"message":"Your credentials lack one or more required privilege scopes.","detail":{"required":["read:pipeline:bitbucket"],"granted":["read:repository:bitbucket"]}}}`,
+			want:    "missing scope read:pipeline:bitbucket",
+			notWant: "https://",
+		},
+		{
+			name:   "unauthorized without username hints at it",
+			status: http.StatusUnauthorized,
+			body:   `{"type":"error","error":{"message":"Unauthorized"}}`,
+			want:   "BITBUCKET_USERNAME",
+		},
+		{
+			name:     "unauthorized with username",
+			status:   http.StatusUnauthorized,
+			username: "me@example.com",
+			want:     "authentication failed (401): check the token",
+			notWant:  "BITBUCKET_USERNAME",
+		},
+		{
+			name:   "not found",
+			status: http.StatusNotFound,
+			body:   `{"type":"error","error":{"message":"Repository not found"}}`,
+			want:   "ws/repo not found",
+		},
+		{
+			name:   "forbidden with string detail",
+			status: http.StatusForbidden,
+			body:   `{"type":"error","error":{"message":"Access denied","detail":"You need admin"}}`,
+			want:   "request failed (403): Access denied",
+		},
+		{
+			name:   "non-json body",
+			status: http.StatusBadGateway,
+			body:   `upstream down`,
+			want:   "request failed (502): upstream down",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, p := newFakeBitbucket(t, func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(tt.status)
+				_, _ = w.Write([]byte(tt.body))
+			})
+			p.Username = tt.username
+			_, err := p.ListEnvironments(context.Background())
+			if err == nil {
+				t.Fatal("expected error")
+			}
+			if !strings.Contains(err.Error(), tt.want) {
+				t.Errorf("error = %q, want it to contain %q", err, tt.want)
+			}
+			if tt.notWant != "" && strings.Contains(err.Error(), tt.notWant) {
+				t.Errorf("error = %q, should not contain %q", err, tt.notWant)
+			}
+		})
+	}
+}

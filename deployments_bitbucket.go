@@ -284,13 +284,52 @@ func (b *BitbucketProvider) doJSON(ctx context.Context, rawURL string, out any) 
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("bitbucket %s returned %d: %s", rawURL, resp.StatusCode, truncate(string(body), 200))
+		return b.httpError(resp.StatusCode, body)
 	}
 
 	if err := json.Unmarshal(body, out); err != nil {
 		return fmt.Errorf("decode response: %w", err)
 	}
 	return nil
+}
+
+// bbErrorBody is Bitbucket's error payload. Detail is either a string or,
+// for missing token scopes, an object with the required/granted scopes.
+type bbErrorBody struct {
+	Error struct {
+		Message string          `json:"message"`
+		Detail  json.RawMessage `json:"detail"`
+	} `json:"error"`
+}
+
+// httpError turns a non-2xx response into a short, actionable message.
+func (b *BitbucketProvider) httpError(status int, body []byte) error {
+	var eb bbErrorBody
+	_ = json.Unmarshal(body, &eb)
+	msg := eb.Error.Message
+
+	var scopes struct {
+		Required []string `json:"required"`
+	}
+	if status == http.StatusForbidden && json.Unmarshal(eb.Error.Detail, &scopes) == nil && len(scopes.Required) > 0 {
+		return fmt.Errorf("bitbucket: token is missing scope %s — create a new token that includes it", strings.Join(scopes.Required, ", "))
+	}
+
+	switch status {
+	case http.StatusUnauthorized:
+		hint := "check the token"
+		if b.Username == "" {
+			hint += "; API tokens and app passwords also need BITBUCKET_USERNAME (your Atlassian email or username)"
+		}
+		return fmt.Errorf("bitbucket: authentication failed (401): %s", hint)
+	case http.StatusNotFound:
+		return fmt.Errorf("bitbucket: %s/%s not found or not accessible with this token (404)", b.Workspace, b.Slug)
+	}
+
+	if msg == "" {
+		msg = truncate(strings.TrimSpace(string(body)), 200)
+	}
+	return fmt.Errorf("bitbucket: request failed (%d): %s", status, msg)
 }
 
 func (b *BitbucketProvider) authHeader() (string, error) {
