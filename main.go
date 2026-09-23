@@ -66,9 +66,24 @@ type Profile struct {
 	TagPrefix    string `json:"tag_prefix"`
 }
 
+type CountryConfig struct {
+	Code    string `json:"code"`
+	QAEnv   string `json:"qa_env,omitempty"`
+	ProdEnv string `json:"prod_env"`
+}
+
+type BitbucketConfig struct {
+	AuthEnv         string          `json:"auth_env,omitempty"`
+	Username        string          `json:"username,omitempty"`
+	Lookback        int             `json:"lookback,omitempty"`
+	CacheTTLSeconds int             `json:"cache_ttl_seconds,omitempty"`
+	Countries       []CountryConfig `json:"countries"`
+}
+
 type Config struct {
-	Active   string             `json:"active"`
-	Profiles map[string]Profile `json:"profiles"`
+	Active    string             `json:"active"`
+	Profiles  map[string]Profile `json:"profiles"`
+	Bitbucket *BitbucketConfig   `json:"bitbucket,omitempty"`
 }
 
 // --- Main ---
@@ -101,8 +116,14 @@ func main() {
 	}
 
 	if len(positional) > 0 {
-		if positional[0] == "config" {
+		switch positional[0] {
+		case "config":
 			if err := handleConfig(positional[1:]); err != nil {
+				fatal(err.Error())
+			}
+			return
+		case "deploys":
+			if err := runDeploys(positional[1:], profileOverride); err != nil {
 				fatal(err.Error())
 			}
 			return
@@ -122,6 +143,7 @@ func printUsage() {
   taghound                       Show releases (branches and tags)
   taghound --dirty               Show only orphan tags (no matching branch)
   taghound --profile <name>      Use a specific profile for this run
+  taghound deploys               Show what is deployed per country (Bitbucket)
   taghound config <command>      Manage configuration profiles
 
 %sConfig commands:%s
@@ -131,6 +153,14 @@ func printUsage() {
                                  Create or update a profile
   config use <name>              Switch active profile
   config delete <name>           Delete a profile (cannot delete 'default')
+  config country set <code> --prod <env> [--qa <env>]
+                                 Add or update a deploy environment
+                                 ({slug} and {country} are expanded per repo)
+  config country delete <code>   Remove a country
+
+%sDeploys options:%s
+  -r, --refresh                  Ignore the cache and query Bitbucket again
+  --envs                         List the repo's Bitbucket environments
 
 %sOptions:%s
   -h, --help                     Show this help
@@ -144,7 +174,9 @@ func printUsage() {
   taghound config use deploy
   taghound -d                                          # show dirty tags only
   taghound --profile default --dirty                   # temporary override
-`, Bold, Cyan, Reset, Bold, Reset, Bold, Reset, Bold, Reset, Bold, Reset)
+  taghound config country set CL --prod 'prd-{slug}-{country}' --qa 'qa-{slug}-{country}'
+  taghound deploys                                     # needs BITBUCKET_TOKEN
+`, Bold, Cyan, Reset, Bold, Reset, Bold, Reset, Bold, Reset, Bold, Reset, Bold, Reset)
 }
 
 // --- Config I/O ---
@@ -230,6 +262,8 @@ func handleConfig(args []string) error {
 		return cmdConfigUse(args[1:])
 	case "delete":
 		return cmdConfigDelete(args[1:])
+	case "country":
+		return cmdConfigCountry(args[1:])
 	default:
 		return fmt.Errorf("unknown config command: '%s'. Run 'taghound -h' for options", args[0])
 	}
@@ -284,6 +318,7 @@ func cmdConfigShow() error {
 	fmt.Printf("  %sTag prefix:%s     %s%s%s\n", Gray, Reset, Cyan, p.TagPrefix, Reset)
 	fmt.Printf("  %sBranch regex:%s   %s%s%s\n", Gray, Reset, Gray, buildBranchPattern(p.BranchPrefix), Reset)
 	fmt.Printf("  %sTag regex:%s      %s%s%s\n", Gray, Reset, Gray, buildTagPattern(p.TagPrefix), Reset)
+	printBitbucketConfig(cfg.Bitbucket)
 	fmt.Println()
 	return nil
 }
@@ -424,6 +459,22 @@ func buildTagRegex(prefix string) *regexp.Regexp {
 
 func buildTagSearchGlob(prefix string) string {
 	return prefix + "*"
+}
+
+// parseVersion extracts a semver from name using a branch or tag regex.
+// Branch regexes only capture major.minor, so Patch stays 0 for them.
+func parseVersion(re *regexp.Regexp, name string) (semver, bool) {
+	m := re.FindStringSubmatch(name)
+	if m == nil {
+		return semver{}, false
+	}
+	var v semver
+	v.Major, _ = strconv.Atoi(m[1])
+	v.Minor, _ = strconv.Atoi(m[2])
+	if len(m) > 3 {
+		v.Patch, _ = strconv.Atoi(m[3])
+	}
+	return v, true
 }
 
 // --- Profile Resolution ---
@@ -609,15 +660,13 @@ func findReleaseBranches(branchRe *regexp.Regexp) []releaseInfo {
 		if line == "" {
 			continue
 		}
-		m := branchRe.FindStringSubmatch(line)
-		if m == nil {
+		v, ok := parseVersion(branchRe, line)
+		if !ok {
 			continue
 		}
-		major, _ := strconv.Atoi(m[1])
-		minor, _ := strconv.Atoi(m[2])
 
 		ri := getRefInfo(line, "branch")
-		ri.Version = semver{Major: major, Minor: minor}
+		ri.Version = v
 		releases = append(releases, ri)
 	}
 	return releases
@@ -635,17 +684,14 @@ func findReleaseTags(tagRe *regexp.Regexp, tagGlob string) []releaseInfo {
 		if line == "" {
 			continue
 		}
-		m := tagRe.FindStringSubmatch(line)
-		if m == nil {
+		v, ok := parseVersion(tagRe, line)
+		if !ok {
 			continue
 		}
-		major, _ := strconv.Atoi(m[1])
-		minor, _ := strconv.Atoi(m[2])
-		patch, _ := strconv.Atoi(m[3])
 
 		releases = append(releases, releaseInfo{
 			Name:    line,
-			Version: semver{Major: major, Minor: minor, Patch: patch},
+			Version: v,
 			Source:  "tag",
 		})
 	}
